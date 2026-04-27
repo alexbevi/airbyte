@@ -31,6 +31,9 @@ private val log = KotlinLogging.logger {}
 private const val COUNT_TOTAL_ALIAS = "total"
 private const val COLUMN_NAME_COLUMN = "column_name"
 
+/** PostgreSQL/Redshift SQL state for DEPENDENT_OBJECTS_STILL_EXIST. */
+private const val SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST = "2BP01"
+
 @Singleton
 class RedshiftAirbyteClient(
     private val dataSource: DataSource,
@@ -126,14 +129,21 @@ class RedshiftAirbyteClient(
     override suspend fun discoverSchema(tableName: TableName): TableSchema {
         val columnsInDb = getColumnsFromDbForDiscovery(tableName)
 
+        // Table does not exist -- return empty schema so the CDK creates it.
+        if (columnsInDb.isEmpty()) {
+            return TableSchema(emptyMap())
+        }
+
         val hasAllAirbyteColumns = columnsInDb.keys.containsAll(COLUMN_NAMES)
         if (!hasAllAirbyteColumns) {
             val message =
-                "The target table (${tableName.namespace}.${tableName.name}) already exists " +
-                    "in the destination, but does not contain Airbyte's internal columns. " +
-                    "Airbyte can only sync to Airbyte-controlled tables. To fix this error, " +
-                    "you must either delete the target table or add a prefix in the connection " +
-                    "configuration in order to sync to a separate table in the destination."
+                """
+                The target table (${tableName.namespace}.${tableName.name}) already exists \
+                in the destination, but does not contain Airbyte's internal columns. \
+                Airbyte can only sync to Airbyte-controlled tables. To fix this error, \
+                you must either delete the target table or add a prefix in the connection \
+                configuration in order to sync to a separate table in the destination.
+                """.trimIndent()
             log.error { message }
             throw ConfigErrorException(message)
         }
@@ -289,21 +299,26 @@ class RedshiftAirbyteClient(
                 connection.createStatement().use { it.execute(query) }
             }
         } catch (e: SQLException) {
-            // PostgreSQL/Redshift error code 2BP01 = DEPENDENT_OBJECTS_STILL_EXIST
-            if (e.sqlState == "2BP01" || e.message?.contains("depends on") == true) {
+            if (
+                e.sqlState == SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST ||
+                    e.message?.contains("depends on") == true
+            ) {
                 val message =
-                    "Failed to modify table because other database objects (such as views " +
-                        "or rules) depend on it. Original error: ${e.message}\n\n" +
-                        "You can manually drop the dependent views before running the sync, " +
-                        "then recreate them afterward. To find dependent views, run:\n" +
-                        "SELECT dependent_ns.nspname, dependent_view.relname " +
-                        "FROM pg_depend " +
-                        "JOIN pg_rewrite ON pg_depend.objid = pg_rewrite.oid " +
-                        "JOIN pg_class AS dependent_view " +
-                        "ON pg_rewrite.ev_class = dependent_view.oid " +
-                        "JOIN pg_namespace dependent_ns " +
-                        "ON dependent_view.relnamespace = dependent_ns.oid " +
-                        "WHERE pg_depend.refobjid = 'your_schema.your_table'::regclass;"
+                    """
+                    Failed to modify table because other database objects (such as views \
+                    or rules) depend on it. Original error: ${e.message}
+
+                    You can manually drop the dependent views before running the sync, \
+                    then recreate them afterward. To find dependent views, run:
+                    SELECT dependent_ns.nspname, dependent_view.relname \
+                    FROM pg_depend \
+                    JOIN pg_rewrite ON pg_depend.objid = pg_rewrite.oid \
+                    JOIN pg_class AS dependent_view \
+                    ON pg_rewrite.ev_class = dependent_view.oid \
+                    JOIN pg_namespace dependent_ns \
+                    ON dependent_view.relnamespace = dependent_ns.oid \
+                    WHERE pg_depend.refobjid = 'your_schema.your_table'::regclass;
+                    """.trimIndent()
                 log.error { message }
                 throw ConfigErrorException(message, e)
             }
